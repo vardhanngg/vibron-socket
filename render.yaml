@@ -19,5 +19,5 @@ services:
       - socket.vibronmax.com
   - type: keyvalue
     name: vibron-redis
-    plan: starter # Use 'free' for testing, 'starter' for production
+    plan: free # Use 'free' for testing, 'starter' for production
     ipAllowList: [] # Restrict to internal connections

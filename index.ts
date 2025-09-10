@@ -1,4 +1,4 @@
-import express from 'express';
+import express, { Request, Response } from 'express';
 import http from 'http';
 import { Server } from 'socket.io';
 import { createClient } from 'redis';
@@ -13,10 +13,23 @@ const io = new Server(server, {
   },
 });
 
+// Health check endpoint to prevent spin-down
+app.get('/healthz', (req: Request, res: Response) => res.status(200).send('OK'));
+
 // Initialize Redis
 const redis = createClient({ url: process.env.REDIS_URL || 'redis://localhost:6379' });
-redis.on('error', (err) => console.error('[redis] Error:', err));
-await redis.connect();
+redis.on('error', (err: Error) => console.error('[redis] Error:', err));
+
+// Wrap top-level async code
+async function initializeRedis() {
+  try {
+    await redis.connect();
+  } catch (err) {
+    console.error('[redis] Connection failed:', err);
+    process.exit(1);
+  }
+}
+initializeRedis();
 
 interface RoomState {
   currentSong: string | null;
@@ -47,10 +60,15 @@ io.on('connection', (socket) => {
       language: isMoodMode ? 'english' : undefined,
       leaderId: socket.id,
     };
-    await redis.set(`room:${roomId}`, JSON.stringify(roomState), { EX: 24 * 60 * 60 }); // Expire after 24 hours
-    socket.join(roomId);
-    socket.emit('roomCreated', roomId);
-    console.log(`[socket] Room created: ${roomId}, Mood Mode: ${isMoodMode}`);
+    try {
+      await redis.set(`room:${roomId}`, JSON.stringify(roomState), { EX: 24 * 60 * 60 });
+      socket.join(roomId);
+      socket.emit('roomCreated', roomId);
+      console.log(`[socket] Room created: ${roomId}, Mood Mode: ${isMoodMode}`);
+    } catch (err) {
+      console.error('[redis] Error creating room:', err);
+      socket.emit('error', 'Failed to create room');
+    }
   });
 
   socket.on('joinRoom', async (roomId: string) => {
@@ -58,111 +76,148 @@ io.on('connection', (socket) => {
       socket.emit('error', 'Invalid room ID');
       return;
     }
-    const roomState = await redis.get(`room:${roomId}`);
-    if (roomState) {
-      const state: RoomState = JSON.parse(roomState);
-      state.users.push(socket.id);
-      await redis.set(`room:${roomId}`, JSON.stringify(state), { EX: 24 * 60 * 60 });
-      socket.join(roomId);
-      socket.emit('roomJoined', { roomId, state });
-      console.log(`[socket] User ${socket.id} joined room ${roomId}`);
-    } else {
-      socket.emit('error', 'Room not found');
+    try {
+      const roomState = await redis.get(`room:${roomId}`);
+      if (roomState) {
+        const state: RoomState = JSON.parse(roomState);
+        state.users.push(socket.id);
+        await redis.set(`room:${roomId}`, JSON.stringify(state), { EX: 24 * 60 * 60 });
+        socket.join(roomId);
+        socket.emit('roomJoined', { roomId, state });
+        console.log(`[socket] User ${socket.id} joined room ${roomId}`);
+      } else {
+        socket.emit('error', 'Room not found');
+      }
+    } catch (err) {
+      console.error('[redis] Error joining room:', err);
+      socket.emit('error', 'Failed to join room');
     }
   });
 
   socket.on('playPause', async ({ roomId, isPlaying, currentTime }: { roomId: string; isPlaying: boolean; currentTime: number }) => {
-    const roomState = await redis.get(`room:${roomId}`);
-    if (roomState && socket.id === JSON.parse(roomState).leaderId) {
-      const state: RoomState = JSON.parse(roomState);
-      state.isPlaying = isPlaying;
-      state.currentTime = currentTime;
-      await redis.set(`room:${roomId}`, JSON.stringify(state), { EX: 24 * 60 * 60 });
-      io.to(roomId).emit('updateState', state);
-      console.log(`[socket] Room ${roomId} play/pause: ${isPlaying}, time: ${currentTime}`);
-    } else {
-      socket.emit('error', 'Only the room leader can control playback');
+    try {
+      const roomState = await redis.get(`room:${roomId}`);
+      if (roomState && socket.id === JSON.parse(roomState).leaderId) {
+        const state: RoomState = JSON.parse(roomState);
+        state.isPlaying = isPlaying;
+        state.currentTime = currentTime;
+        await redis.set(`room:${roomId}`, JSON.stringify(state), { EX: 24 * 60 * 60 });
+        io.to(roomId).emit('updateState', state);
+        console.log(`[socket] Room ${roomId} play/pause: ${isPlaying}, time: ${currentTime}`);
+      } else {
+        socket.emit('error', 'Only the room leader can control playback');
+      }
+    } catch (err) {
+      console.error('[redis] Error updating play/pause:', err);
+      socket.emit('error', 'Failed to update playback');
     }
   });
 
   socket.on('changeSong', async ({ roomId, songUrl, songId, title, artist, image }: { roomId: string; songUrl: string; songId: string; title?: string; artist?: string; image?: string }) => {
-    const roomState = await redis.get(`room:${roomId}`);
-    if (roomState && socket.id === JSON.parse(roomState).leaderId) {
-      const state: RoomState = JSON.parse(roomState);
-      state.currentSong = songUrl;
-      state.currentSongId = songId;
-      state.currentTime = 0;
-      state.isPlaying = true;
-      state.title = title;
-      state.artist = artist;
-      state.image = image;
-      await redis.set(`room:${roomId}`, JSON.stringify(state), { EX: 24 * 60 * 60 });
-      io.to(roomId).emit('updateState', state);
-      console.log(`[socket] Room ${roomId} changed song: ${songId}`);
-    } else {
-      socket.emit('error', 'Only the room leader can change songs');
+    try {
+      const roomState = await redis.get(`room:${roomId}`);
+      if (roomState && socket.id === JSON.parse(roomState).leaderId) {
+        const state: RoomState = JSON.parse(roomState);
+        state.currentSong = songUrl;
+        state.currentSongId = songId;
+        state.currentTime = 0;
+        state.isPlaying = true;
+        state.title = title;
+        state.artist = artist;
+        state.image = image;
+        await redis.set(`room:${roomId}`, JSON.stringify(state), { EX: 24 * 60 * 60 });
+        io.to(roomId).emit('updateState', state);
+        console.log(`[socket] Room ${roomId} changed song: ${songId}`);
+      } else {
+        socket.emit('error', 'Only the room leader can change songs');
+      }
+    } catch (err) {
+      console.error('[redis] Error changing song:', err);
+      socket.emit('error', 'Failed to change song');
     }
   });
 
   socket.on('changeMoodSong', async ({ roomId, songUrl, songId, mood, language, title, artist }: { roomId: string; songUrl: string; songId: string; mood: string; language: string; title?: string; artist?: string }) => {
-    const roomState = await redis.get(`room:${roomId}`);
-    if (roomState && socket.id === JSON.parse(roomState).leaderId) {
-      const state: RoomState = JSON.parse(roomState);
-      state.currentSong = songUrl;
-      state.currentSongId = songId;
-      state.mood = mood;
-      state.language = language;
-      state.currentTime = 0;
-      state.isPlaying = true;
-      state.title = title;
-      state.artist = artist;
-      await redis.set(`room:${roomId}`, JSON.stringify(state), { EX: 24 * 60 * 60 });
-      io.to(roomId).emit('updateState', state);
-      console.log(`[socket] Room ${roomId} changed mood song: ${songId}, mood: ${mood}, language: ${language}`);
-    } else {
-      socket.emit('error', 'Only the room leader can change songs');
+    try {
+      const roomState = await redis.get(`room:${roomId}`);
+      if (roomState && socket.id === JSON.parse(roomState).leaderId) {
+        const state: RoomState = JSON.parse(roomState);
+        state.currentSong = songUrl;
+        state.currentSongId = songId;
+        state.mood = mood;
+        state.language = language;
+        state.currentTime = 0;
+        state.isPlaying = true;
+        state.title = title;
+        state.artist = artist;
+        await redis.set(`room:${roomId}`, JSON.stringify(state), { EX: 24 * 60 * 60 });
+        io.to(roomId).emit('updateState', state);
+        console.log(`[socket] Room ${roomId} changed mood song: ${songId}, mood: ${mood}, language: ${language}`);
+      } else {
+        socket.emit('error', 'Only the room leader can change songs');
+      }
+    } catch (err) {
+      console.error('[redis] Error changing mood song:', err);
+      socket.emit('error', 'Failed to change mood song');
     }
   });
 
   socket.on('seek', async ({ roomId, currentTime }: { roomId: string; currentTime: number }) => {
-    const roomState = await redis.get(`room:${roomId}`);
-    if (roomState && socket.id === JSON.parse(roomState).leaderId) {
-      const state: RoomState = JSON.parse(roomState);
-      state.currentTime = currentTime;
-      await redis.set(`room:${roomId}`, JSON.stringify(state), { EX: 24 * 60 * 60 });
-      io.to(roomId).emit('updateState', state);
-      console.log(`[socket] Room ${roomId} seeked to: ${currentTime}`);
-    } else {
-      socket.emit('error', 'Only the room leader can seek');
+    try {
+      const roomState = await redis.get(`room:${roomId}`);
+      if (roomState && socket.id === JSON.parse(roomState).leaderId) {
+        const state: RoomState = JSON.parse(roomState);
+        state.currentTime = currentTime;
+        await redis.set(`room:${roomId}`, JSON.stringify(state), { EX: 24 * 60 * 60 });
+        io.to(roomId).emit('updateState', state);
+        console.log(`[socket] Room ${roomId} seeked to: ${currentTime}`);
+      } else {
+        socket.emit('error', 'Only the room leader can seek');
+      }
+    } catch (err) {
+      console.error('[redis] Error seeking:', err);
+      socket.emit('error', 'Failed to seek');
     }
   });
 
   socket.on('disconnect', async () => {
-    for (const key of await redis.keys('room:*')) {
-      const roomState = await redis.get(key);
-      if (roomState) {
-        const state: RoomState = JSON.parse(roomState);
-        state.users = state.users.filter((id) => id !== socket.id);
-        if (state.users.length === 0) {
-          await redis.del(key);
-          console.log(`[socket] Room ${key.replace('room:', '')} deleted (empty)`);
-        } else {
-          await redis.set(key, JSON.stringify(state), { EX: 24 * 60 * 60 });
-          io.to(key.replace('room:', '')).emit('updateState', state);
+    try {
+      for (const key of await redis.keys('room:*')) {
+        const roomState = await redis.get(key);
+        if (roomState) {
+          const state: RoomState = JSON.parse(roomState);
+          state.users = state.users.filter((id) => id !== socket.id);
+          if (state.leaderId === socket.id && state.users.length > 0) {
+            state.leaderId = state.users[0];
+            console.log(`[socket] Room ${key.replace('room:', '')} leader reassigned to ${state.leaderId}`);
+          }
+          if (state.users.length === 0) {
+            await redis.del(key);
+            console.log(`[socket] Room ${key.replace('room:', '')} deleted (empty)`);
+          } else {
+            await redis.set(key, JSON.stringify(state), { EX: 24 * 60 * 60 });
+            io.to(key.replace('room:', '')).emit('updateState', state);
+          }
         }
       }
+      console.log(`[socket] User disconnected: ${socket.id}`);
+    } catch (err) {
+      console.error('[redis] Error handling disconnect:', err);
     }
-    console.log(`[socket] User disconnected: ${socket.id}`);
   });
 });
 
 setInterval(async () => {
-  for (const key of await redis.keys('room:*')) {
-    const roomState = await redis.get(key);
-    if (roomState) {
-      const state: RoomState = JSON.parse(roomState);
-      io.to(key.replace('room:', '')).emit('updateState', state);
+  try {
+    for (const key of await redis.keys('room:*')) {
+      const roomState = await redis.get(key);
+      if (roomState) {
+        const state: RoomState = JSON.parse(roomState);
+        io.to(key.replace('room:', '')).emit('updateState', state);
+      }
     }
+  } catch (err) {
+    console.error('[redis] Error in periodic sync:', err);
   }
 }, 5000);
 
